@@ -6,12 +6,12 @@ use std::{
     time::{self, Duration},
 };
 
-use crate::access::Access;
+use crate::{access::Access, Cache};
 
 pub fn evictor<K, V, H>(
     max_count: usize,
     max_old: Duration,
-    mut map: Map<K, V, H>,
+    mut map: Map<K, Cache<K, V>, H>,
     close: Arc<Mutex<bool>>,
     head: Arc<Access<K>>,
 ) where

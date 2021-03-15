@@ -3,7 +3,10 @@ use cmap::{DefaultHasher, Map};
 use std::{
     borrow::Borrow,
     hash::{BuildHasher, Hash, Hasher},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicPtr, Ordering::SeqCst},
+        Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -13,8 +16,25 @@ use crate::{access::Access, evictor::evictor};
 mod access;
 mod evictor;
 
-struct Lru<K, V, H = DefaultHasher> {
-    maps: Vec<Map<K, V, H>>,
+pub struct Cache<K, V> {
+    value: V,
+    access: AtomicPtr<Access<K>>,
+}
+
+impl<K, V> Clone for Cache<K, V>
+where
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        Cache {
+            value: self.value.clone(),
+            access: AtomicPtr::new(self.access.load(SeqCst)),
+        }
+    }
+}
+
+pub struct Lru<K, V, H = DefaultHasher> {
+    maps: Vec<Map<K, Cache<K, V>, H>>,
     heads: Vec<Arc<Access<K>>>,
     hash_builder: H,
     max_count: usize,
@@ -57,8 +77,9 @@ impl<K, V, H> Lru<K, V, H> {
         V: 'static + Send + Clone,
         H: 'static + Send + Clone + BuildHasher,
     {
-        let maps: Vec<Map<K, V, H>> = {
-            let iter = (0..shards).map(|_| Map::new(concurrency + 1, hash_builder.clone()));
+        let maps: Vec<Map<K, Cache<K, V>, H>> = {
+            let concurrency = concurrency + 1;
+            let iter = (0..shards).map(|_| Map::new(concurrency, hash_builder.clone()));
             iter.collect()
         };
         let close = Arc::new(Mutex::new(false));
@@ -83,19 +104,84 @@ impl<K, V, H> Lru<K, V, H> {
 
     pub fn get<Q>(&self, key: &Q) -> Option<V>
     where
-        K: Borrow<Q>,
-        Q: Hash + ?Sized,
+        K: Borrow<Q> + Clone,
+        Q: ToOwned<Owned = K> + PartialEq + ?Sized + Hash,
         H: BuildHasher,
+        V: Clone,
     {
         let shard = {
             let hasher = self.hash_builder.build_hasher();
             (key_to_hash32(key, hasher) % (self.maps.len() as u32)) as usize
         };
-        todo!()
+
+        let (map, head) = (&self.maps[shard], &self.heads[shard]);
+        let access_ptr = Box::leak(Access::new(key.to_owned())) as *const Access<K>;
+
+        map.get_with(key, |cache: &Cache<K, V>| {
+            let old = cache.access.load(SeqCst);
+            let new = access_ptr as *mut Access<K>;
+            match cache.access.compare_exchange(old, new, SeqCst, SeqCst) {
+                Ok(_) => {
+                    unsafe { old.as_ref().unwrap() }.delete();
+                    head.prepend(unsafe { Box::from_raw(new) });
+                }
+                Err(_) => {
+                    let _access = unsafe { Box::from_raw(new) }; // drop this access
+                }
+            }
+            cache.value.clone()
+        })
     }
 
-    pub fn set(key: K, value: V) {
-        todo!()
+    pub fn set(&mut self, key: K, value: V)
+    where
+        K: Clone + PartialEq + Hash,
+        V: Clone,
+        H: BuildHasher,
+    {
+        let shard = {
+            let hasher = self.hash_builder.build_hasher();
+            (key_to_hash32(&key, hasher) % (self.maps.len() as u32)) as usize
+        };
+
+        let (map, head) = (&mut self.maps[shard], &self.heads[shard]);
+        let access_ptr = Box::leak(Access::new(key.to_owned()));
+        let value = Cache {
+            value,
+            access: AtomicPtr::new(access_ptr),
+        };
+
+        head.prepend(unsafe { Box::from_raw(access_ptr) });
+        match map.set(key, value) {
+            Some(Cache { access, .. }) => {
+                let access = unsafe { access.load(SeqCst).as_ref().unwrap() };
+                access.delete()
+            }
+            None => (),
+        }
+    }
+
+    pub fn remove<Q>(&mut self, key: &Q)
+    where
+        K: Clone + Borrow<Q>,
+        V: Clone,
+        Q: PartialEq + Hash + ?Sized,
+        H: BuildHasher,
+    {
+        let shard = {
+            let hasher = self.hash_builder.build_hasher();
+            (key_to_hash32(&key, hasher) % (self.maps.len() as u32)) as usize
+        };
+
+        let map = &mut self.maps[shard];
+
+        match map.remove(key) {
+            Some(Cache { access, .. }) => {
+                let access = unsafe { access.load(SeqCst).as_ref().unwrap() };
+                access.delete()
+            }
+            None => (),
+        }
     }
 }
 
