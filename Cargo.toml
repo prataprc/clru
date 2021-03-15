@@ -1,0 +1,11 @@
+[package]
+name = "clru"
+version = "0.1.0"
+authors = ["prataprc <prataprc@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+mkit = { path = "../mkit", version = "0.4.0" }
+cmap = { path = "../cmap", version = "0.2.0" }
