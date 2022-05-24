@@ -8,3 +8,5 @@ edition = "2018"
 
 [dependencies]
 cmap = { path = "../cmap", version = "0.3.0" }
+num_cpus = "1.13.1"
+log = "0.4.17"
