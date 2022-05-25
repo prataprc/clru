@@ -48,7 +48,6 @@ impl LruBuilder {
             max_memory: self.max_memory,
             max_old: self.max_old,
 
-            map: map.cloned(),
             list: Arc::clone(&access_list),
             cur_entries: Arc::clone(&cur_entries),
             cur_memory: Arc::clone(&cur_memory),
@@ -56,10 +55,12 @@ impl LruBuilder {
 
             n_evicted: 0,
             n_deleted: 0,
-            n_removed: 0,
             n_older: 0,
         };
-        let handle = thread::spawn(move || evictor.run());
+        let handle = {
+            let map = map.cloned();
+            thread::spawn(move || evictor.run(map))
+        };
 
         let inner = Inner {
             evictor: Some(handle),
@@ -88,20 +89,20 @@ pub struct Lru<K, V, H = cmap::DefaultHasher> {
     max_old: Option<Duration>,
 
     map: cmap::Map<K, Value<K, V>, H>,
-    inner: Arc<Inner<K, V, H>>,
+    inner: Arc<Inner<K>>,
     list: Arc<list::List<K>>,
     cur_entries: Arc<AtomicUsize>,
     cur_memory: Arc<AtomicUsize>,
 }
 
-struct Inner<K, V, H> {
-    evictor: Option<thread::JoinHandle<Result<Evictor<K, V, H>>>>,
+struct Inner<K> {
+    evictor: Option<thread::JoinHandle<Result<Evictor<K>>>>,
     n_gets: AtomicUsize,
     n_sets: AtomicUsize,
     closed: Arc<AtomicBool>,
 }
 
-impl<K, V, H> Drop for Inner<K, V, H> {
+impl<K> Drop for Inner<K> {
     fn drop(&mut self) {
         self.closed.store(true, SeqCst);
 
@@ -112,7 +113,6 @@ impl<K, V, H> Drop for Inner<K, V, H> {
                     n_sets: self.n_sets.load(SeqCst),
                     n_evicted: evictor.n_evicted,
                     n_deleted: evictor.n_deleted,
-                    n_removed: evictor.n_removed,
                     n_older: evictor.n_older,
                 };
                 debug!("{:?}", stats);
@@ -148,18 +148,15 @@ impl<K, V, H> Lru<K, V, H> {
         V: Clone,
     {
         let val = self.map.get_with(key, |value: &Value<K, V>| loop {
-            let old_ptr = value.access.load(SeqCst);
-            let new_ptr = self.list.prepend(key.to_owned())?;
-            match value
-                .access
-                .compare_exchange(old_ptr, new_ptr, SeqCst, SeqCst)
-            {
+            let optr = value.access.load(SeqCst);
+            let nptr = self.list.prepend(key.to_owned())?;
+            match value.access.compare_exchange(optr, nptr, SeqCst, SeqCst) {
                 Ok(_) => {
-                    unsafe { old_ptr.as_ref().unwrap() }.delete();
+                    unsafe { optr.as_ref().unwrap() }.delete();
                     break Ok(value.value.clone());
                 }
                 Err(_) => {
-                    unsafe { new_ptr.as_ref().unwrap() }.delete();
+                    unsafe { nptr.as_ref().unwrap() }.delete();
                 }
             }
 
@@ -198,6 +195,9 @@ pub struct Stats {
     pub n_sets: usize,
     pub n_evicted: usize,
     pub n_deleted: usize,
-    pub n_removed: usize,
     pub n_older: usize,
 }
+
+#[cfg(test)]
+#[path = "lru_test.rs"]
+mod lru_test;

@@ -12,7 +12,7 @@ const MAX_SLEEP: f64 = 10.0; // in millisecons
 /// * Node is older than configured elapsed time, optional.
 /// * Number of nodes in the access list exceed the count-limit, `max_entries`.
 /// * Memory footprint of cache exceeds size-limit, `max_memory`.
-pub(crate) struct Evictor<K, V, H> {
+pub(crate) struct Evictor<K> {
     pub(crate) max_entries: usize,
     pub(crate) max_memory: Option<usize>,
     pub(crate) max_old: Option<Duration>,
@@ -22,21 +22,34 @@ pub(crate) struct Evictor<K, V, H> {
     pub(crate) n_evicted: usize,
     pub(crate) n_deleted: usize,
     pub(crate) n_older: usize,
-    pub(crate) n_removed: usize,
 
-    pub(crate) map: cmap::Map<K, Value<K, V>, H>,
     pub(crate) list: Arc<list::List<K>>,
     pub(crate) closed: Arc<AtomicBool>,
 }
 
-impl<K, V, H> Evictor<K, V, H>
+impl<K> Evictor<K>
 where
     K: Clone + PartialEq + Hash,
-    V: Clone,
-    H: BuildHasher,
 {
-    pub fn run(mut self) -> Result<Self> {
-        let max_old = self.max_old.as_ref();
+    pub fn run<V, H>(mut self, mut map: cmap::Map<K, Value<K, V>, H>) -> Result<Self>
+    where
+        V: Clone,
+        H: BuildHasher,
+    {
+        let mut remove = |key: &K| match map.remove(key) {
+            Some(value) => {
+                self.cur_entries.fetch_sub(1, SeqCst);
+                unsafe {
+                    let ptr = value.access.load(SeqCst);
+                    ptr.as_ref().unwrap().delete()
+                };
+            }
+            None => (),
+        };
+
+        let mut n_evicted: usize = 0;
+        let mut n_deleted: usize = 0;
+        let mut n_older: usize = 0;
 
         loop {
             if self.closed.load(SeqCst) {
@@ -59,63 +72,43 @@ where
 
             let now = err_at!(Fatal, UNIX_EPOCH.elapsed())?;
 
-            let mut to_evict = {
-                let a = self.cur_entries.load(SeqCst);
-                if self.max_entries < a {
-                    a - self.max_entries
-                } else {
-                    0
-                }
-            };
+            let mut num_evicts = self.num_evicts();
+            let mut counts = 0;
             loop {
-                let node_next: Box<list::Node<K>> = match (node, max_old) {
-                    (list::Node::Z, _) => break,
-                    (list::Node::T { deleted, next, .. }, _) if deleted.load(SeqCst) => {
-                        self.n_deleted += 1;
+                let (key, born, deleted, next) = match node {
+                    list::Node::Z => break,
+                    list::Node::T {
+                        key,
+                        born,
+                        deleted,
+                        next,
+                    } => (key, born, deleted, next),
+                };
+
+                let node_next: Box<list::Node<K>> = match self.max_old {
+                    _ if deleted.load(SeqCst) => {
+                        n_deleted += 1;
                         next.take().unwrap()
                     }
-                    (
-                        list::Node::T {
-                            key, born, next, ..
-                        },
-                        Some(max_old),
-                    ) if &(now - *born) > max_old => {
-                        self.n_older += 1;
-                        match self.map.remove(key) {
-                            Some(value) => {
-                                self.n_removed += 1;
-                                self.cur_entries.fetch_sub(1, SeqCst);
-                                unsafe {
-                                    let ptr = value.access.load(SeqCst);
-                                    ptr.as_ref().unwrap().delete()
-                                };
-                            }
-                            None => (),
-                        }
+                    _ if counts > self.max_entries && num_evicts > 0 => {
+                        remove(key);
+                        n_older += 1;
+                        num_evicts -= 1;
                         next.take().unwrap()
                     }
-                    (list::Node::T { key, next, .. }, _) if to_evict > 0 => {
-                        match self.map.remove(key) {
-                            Some(value) => {
-                                self.n_removed += 1;
-                                self.cur_entries.fetch_sub(1, SeqCst);
-                                unsafe {
-                                    let ptr = value.access.load(SeqCst);
-                                    ptr.as_ref().unwrap().delete()
-                                };
-                            }
-                            None => (),
-                        }
+                    Some(max_old) if (now - *born) > max_old => {
+                        remove(key);
+                        n_older += 1;
                         next.take().unwrap()
                     }
-                    (list::Node::T { next, .. }, _) => {
+                    _ => {
                         node = next.as_mut().unwrap();
+                        counts += 1;
                         continue;
                     }
                 };
 
-                self.n_evicted += 1;
-                to_evict -= 1;
+                n_evicted += 1;
 
                 let _drop_node = match prev_node {
                     list::Node::T { next, .. } => next.replace(node_next),
@@ -128,6 +121,10 @@ where
                 }
             }
         }
+
+        self.n_evicted = n_evicted;
+        self.n_deleted = n_deleted;
+        self.n_older = n_older;
 
         Ok(self)
     }
@@ -152,6 +149,15 @@ where
         match ratio {
             ratio if ratio >= 1.0 => None,
             ratio => Some(Duration::from_millis((MAX_SLEEP * (1.0 - ratio)) as u64)),
+        }
+    }
+
+    fn num_evicts(&self) -> usize {
+        let a = self.cur_entries.load(SeqCst);
+        if self.max_entries < a {
+            a - self.max_entries
+        } else {
+            0
         }
     }
 }
