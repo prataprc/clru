@@ -77,12 +77,9 @@ where
             loop {
                 let (key, born, deleted, next) = match node {
                     list::Node::Z => break,
-                    list::Node::T {
-                        key,
-                        born,
-                        deleted,
-                        next,
-                    } => (key, born, deleted, next),
+                    list::Node::T { key, born, deleted, next } => {
+                        (key, born, deleted, next)
+                    }
                 };
 
                 let node_next: Box<list::Node<K>> = match self.max_old {

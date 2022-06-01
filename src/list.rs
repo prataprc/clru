@@ -12,9 +12,7 @@ pub struct List<K> {
 
 impl<K> Default for List<K> {
     fn default() -> List<K> {
-        List {
-            head: AtomicPtr::new(Box::leak(Box::new(Node::Z))),
-        }
+        List { head: AtomicPtr::new(Box::leak(Box::new(Node::Z))) }
     }
 }
 
